@@ -1,0 +1,427 @@
+image:
+  finvmharborp01.finbel.intra/trv-base/ng-cli:1.1.0
+  #NPM_CONFIG_REGISTRY
+variables:
+  # environment variables which should be defined
+  # SONAR_HOST_URL:
+  # SONAR_TOKEN:
+  # REGISTRY: The docker image registry (harbor url)
+  # REGISTRY_PASSWORD
+  # REGISTRY_USER
+  # NPM_CONFIG_REGISTRY
+  # RELEASE_BOT_ACCESS_TOKEN:
+  # IMAGE_REPO
+  # CHART_REPO
+  DOCKER_TLS_CERTDIR: ''
+
+  # Environment variables which might be the same for all environment or not, please check
+  # K8S_SERVICE_ACCOUNT : kubectl get serviceaccounts  -n doa-masp-review | grep sa-gitlab
+  # K8S_CA: content of the ca.crt used by the cluster to connect to , used for kubectl config set-cluster xyz --certificate-authority
+
+  # Environment specific values of following parameters should be configured for each of the environments using the scope option of gitlab
+  # Review environment token should be configured using "All environments" and not protected
+  # All tokens should be masked
+  #  It is best to pipe the token to a file first to make sure you copy it correctly
+  # K8S_SERVICE_ACCOUNT_TOKEN : kubectl -n doa-masp-review get secret $(kubectl -n doa-masp-review get serviceaccount sa-gitlab-doa-masp-demo   -o jsonpath='{.secrets[0].name}') -o jsonpath='{.data.token}'  > token.txt
+  # K8S_SERVER : server url of k8s cluster eg https://pks-cluster-test1.finbel.intra:8443
+  # K8S_NAMESPACE
+
+  # project specific variables
+
+  # name of the harbor project
+  REGISTRY_PROJECT: doa-tsdui
+  # name of the chart in the harbor project eg idms/idmsui
+  CHART_NAME: tsdui
+
+  # host name for the dns in the different environments
+  DNS_NAME: tsd
+
+  # Docker image name relative to the $IMAGE_REPO/$REGISTRY_PROJECT/
+  IMAGE_NAME: tsdui
+
+  # Name of the release Helm will install need to be unique in the namespace
+  # make sure to include major(only) version if we need to support running two versions next to each other
+  # so if we need a v2 backwards incompatible version release name should be demo-v2
+  RELEASE_NAME: tsdui
+
+  CYPRESS_API_URL: http://cypress-director.tsdui.dev.finbel.intra/
+
+.await_cypress_director: &await_cypress_director |
+  until curl -sI $CYPRESS_API_URL|| [ $? -eq 56 ] ; do echo -n "." && sleep 2 ; done;
+
+stages:
+  - Build:Version
+  - Build
+  - Test:Test
+  - Test:Report
+  - Test:Gate
+  - Publish
+  - Review
+  - QA:Deploy
+  - QA:Validate
+  - Deploy
+  - Release
+
+cache:
+  # only share between jobs of the same branch
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/
+    - .npm/
+  policy: pull
+
+.version: &version |
+  export VERSION=${CI_COMMIT_TAG:-v`cat version.txt`-${CI_PIPELINE_IID}-${CI_COMMIT_SHORT_SHA}} && export VERSION=${VERSION:1} ; echo VERSION=$VERSION
+
+# Determine a version based on a tag which is being build or the git revision
+version:
+  stage: Build:Version
+  image: finvmharborp01.finbel.intra/trv-utility/git:1.0.10
+  cache: {}
+  variables:
+    GIT_DEPTH: 0 # make sure we have all the tags, tune this value if the repo gets to big
+  script:
+    - export GIT_REVISION=$(git describe --abbrev=0 --tags --match "v[0-9]*") || echo "no tags in repo"
+    - VERSION=${CI_COMMIT_TAG:-${GIT_REVISION:-v0.0.1}} && export VERSION=${VERSION:1} && echo VERSION=$VERSION
+    - echo $VERSION > version.txt
+  artifacts:
+    expire_in: 1 year
+    paths:
+      - version.txt
+
+build:
+  stage: Build
+  needs:
+    - version
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+      - .npm/
+    policy: push
+  variables:
+    CYPRESS_INSTALL_BINARY: 0
+  script:
+    - npm ci --cache .npm --prefer-offline --no-audit --fetch-retries 3 --fetch-retry-mintimeout 15000 --fetch-retry-maxtimeout 90000
+    - ng build --prod --output-path=dist
+  artifacts:
+    paths:
+      - dist
+
+unit_test:
+  stage: Test:Test
+  needs:
+    - version
+    - build
+  allow_failure: false
+  script:
+    - npm run test:coverage
+  artifacts:
+    paths:
+      - output
+    reports:
+      junit:
+        - output/junit.xml
+        - output/coverage/jest/test-report.xml
+
+e2e_test:
+  stage: Test:Test
+  parallel: 4
+  needs:
+    - version
+    - build
+  image: finvmharborp01.finbel.intra/trv-cypress/included:7.6.0
+  allow_failure: false
+  script:
+    - npm run start:ci&
+    - npx cy2 run --record --key gitlab-ci --parallel --ci-build-id $CI_PIPELINE_ID
+  after_script:
+    - node e2e/cucumber-report.js
+    # kill hanging npm serve
+    - pkill -9 node
+  artifacts:
+    when: always
+    paths:
+      - output/e2e
+      - output/cucumber-json/
+      - output/cucumber-html-report
+    reports:
+      junit:
+        - output/e2e/junit-*.xml
+
+e2e_test_report:
+  stage: Test:Report
+  needs:
+    - version
+    - e2e_test
+  allow_failure: false
+  script:
+    - node e2e/cucumber-report.js
+  artifacts:
+    paths:
+      - output/e2e
+      - output/cucumber-json/
+      - output/cucumber-html-report
+
+lint:
+  stage: Test:Test
+  needs:
+    - version
+    - build
+  script:
+    - npm run lint
+      # todo share artifacts
+
+check_code_format:
+  stage: Test:Test
+  script:
+    - npx prettier --check .
+
+quality_gate:
+  stage: Test:Gate
+  dependencies: [version, unit_test, e2e_test]
+  needs:
+    - version
+    - unit_test
+    - e2e_test
+  image: finvmharborp01.finbel.intra/trv-gitlab-runner/sonar-scanner-cli:4.3
+  script:
+    - pwd
+    - ls -lrt
+    - export VERSION=`cat version.txt`+
+    - sonar-scanner
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.login=$SONAR_LOGIN
+      -Dsonar.projectVersion=${CI_COMMIT_TAG:-$VERSION}
+      -Dsonar.sourceEncoding=UTF-8
+      -Dsonar.sources=src/app
+      -Dsonar.exclusions=**/node_modules/**
+      -Dsonar.projectKey=${RELEASE_NAME}
+      -Dsonar.projectName=${RELEASE_NAME}
+      -Dsonar.projectVersion=$VERSION
+      -Dsonar.test.inclusions=**/*.spec.ts
+      -Dsonar.javascript.lcov.reportPaths=output/coverage/jest/lcov.info
+      -Dsonar.testExecutionReportPaths=output/coverage/jest/test-report.xml
+      -Dsonar.qualitygate.wait=true
+      -Dsonar.tests="src"
+      -Dsonar.language=js
+    - ls -lrt
+
+publish_docker:
+  stage: Publish
+  cache: {}
+  needs:
+    - build
+    - version
+  dependencies:
+    - build
+    - version
+  image:
+    name: finvmharborp01.finbel.intra/trv-gitlab-runner/kaniko-executor/executor:v1.5.1
+    entrypoint: ['']
+  script:
+    - echo "REGISTRY_USER= $REGISTRY_USER - make sure your robot username is escaped correctly like robot\$\$doa-tsdui-gitlab and it is not expired"
+    - echo "{\"auths\":{\"$REGISTRY\":{\"username\":\"$REGISTRY_USER\",\"password\":\"$REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - echo "$REGISTRY_CA" >> /kaniko/ssl/certs/ca-certificates.crt
+    # in case building for master branch add a master tag (used for retention rules)
+    - \[[ "$CI_COMMIT_REF_NAME" == "master" ]] && export TAG_MASTER=" --destination $REGISTRY/${REGISTRY_PROJECT}/${IMAGE_NAME}:master "
+    - *version
+    - /kaniko/executor
+      --cache=true --cache-copy-layers --context $CI_PROJECT_DIR
+      --dockerfile $CI_PROJECT_DIR/Dockerfile
+      --destination $REGISTRY/${REGISTRY_PROJECT}/${IMAGE_NAME}:${VERSION}
+      --destination $REGISTRY/${REGISTRY_PROJECT}/${IMAGE_NAME}:latest
+      $TAG_MASTER
+      --digest-file $CI_PROJECT_DIR/image-digest.txt
+  artifacts:
+    expire_in: 1 year
+    paths:
+      - image-digest.txt
+
+publish_helm:
+  stage: Publish
+  cache: {}
+  needs:
+    - build
+    - version
+  dependencies:
+    - version
+  image: finvmharborp01.finbel.intra/trv-gitlab-runner/helm-kubectl:3.3.4-helm-push
+  script:
+    - *version
+    - helm package $CI_PROJECT_DIR/chart/ -d $CI_PROJECT_DIR/target/chart --app-version ${VERSION} --version ${VERSION}
+    - echo "$REGISTRY_CA" >> $CI_PROJECT_DIR/ca.crt
+    - helm push $CI_PROJECT_DIR/target/chart/${CHART_NAME}-${VERSION}.tgz ${CHART_REPO}/${REGISTRY_PROJECT}
+      --ca-file $CI_PROJECT_DIR/ca.crt
+      --username=$REGISTRY_USER
+      --password=$REGISTRY_PASSWORD
+
+.kube_config: &kube_config |
+  echo "${REGISTRY_CA?}" > /usr/local/share/ca-certificates/registry-ca.crt && echo "REGISTRY_CA=$REGISTRY_CA" && \
+  echo "${K8S_CA?}" > /usr/local/share/ca-certificates/k8s-ca.crt && echo "K8S_CA=$K8S_CA" && \
+  update-ca-certificates && \
+  echo "creating kube config for env $ENV_NAME with user $K8S_SERVICE_ACCOUNT" && \
+  kubectl config set-cluster ${ENV_NAME?} --server="${K8S_SERVER?}" --insecure-skip-tls-verify=true && \
+  kubectl config set-credentials ${K8S_SERVICE_ACCOUNT?} --token="$(echo ${K8S_SERVICE_ACCOUNT_TOKEN?} | base64 -d)" && \
+  kubectl config set-context $ENV_NAME --cluster=$ENV_NAME --user=$K8S_SERVICE_ACCOUNT  && \
+  kubectl config use-context $ENV_NAME && \
+  echo "Testing connection: listing service accounts in namespace ${K8S_NAMESPACE?}" && kubectl -n ${K8S_NAMESPACE?} get serviceaccounts
+
+# TODO replace line with --insecure-skip-tls-verify=true once the pks certificates support the FQDN
+# kubectl config set-cluster ${ENV_NAME?} --server="${K8S_SERVER?}" --certificate-authority=/usr/local/share/ca-certificates/k8s-ca.crt && \
+
+# task to deploy a helm chart
+.install: &install
+  cache: {}
+  dependencies: [publish_docker, version]
+  image: finvmharborp01.finbel.intra/trv-gitlab-runner/helm-kubectl:3.2.1
+  script:
+    - *kube_config
+    - *version
+    - export RELEASE_NAME_SHORT=${RELEASE_NAME:0:52}
+    - export IMAGE_SHA=`cat image-digest.txt` && echo IMAGE_SHA=$IMAGE_SHA
+    - \[[ -f $CI_PROJECT_DIR/env/$ENV_NAME/values.yaml ]] && VALUES_YAML="-f $CI_PROJECT_DIR/env/$ENV_NAME/values.yaml"
+    - echo "Installing release ${RELEASE_NAME_SHORT} of chart ${CHART_NAME} with version ${VERSION} and image ${IMAGE_REPO}/${REGISTRY_PROJECT}/${IMAGE_NAME} with image.tag ${VERSION}${IMAGE_SHA:+@}${IMAGE_SHA} in namespace ${K8S_NAMESPACE} ingress will be using host ${ENV_HOST}"
+    - helm upgrade
+      ${RELEASE_NAME_SHORT?}
+      ${CHART_NAME?}
+      --version ${VERSION}
+      --repo ${CHART_REPO?}/${REGISTRY_PROJECT?}
+      --install --atomic --timeout ${INSTALL_TIMEOUT:-5m} --wait
+      --kube-context $ENV_NAME
+      --namespace ${K8S_NAMESPACE?}
+      $VALUES_YAML
+      --set image.repository="${IMAGE_REPO}/${REGISTRY_PROJECT}/${IMAGE_NAME}"
+      --set image.tag="${VERSION}${IMAGE_SHA:+@}${IMAGE_SHA}"
+      --set ingress.hosts[0].host="${ENV_HOST}"
+      --username=$REGISTRY_USER
+      --password=$REGISTRY_PASSWORD
+    - echo "Review app is deployed here http://${ENV_HOST}"
+  environment:
+    name: $ENV_NAME
+    url: http://${ENV_HOST}
+  resource_group: $ENV_NAME
+
+review_deploy:
+  <<: *install
+  stage: Review
+  needs:
+    - version
+    - publish_docker
+    - publish_helm
+  variables:
+    ENV_NAME: review
+    ENV_HOST: ${CI_COMMIT_REF_SLUG}.${CHART_NAME}.dev.finbel.intra
+    RELEASE_NAME: ${CHART_NAME}-${CI_COMMIT_REF_SLUG}
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    on_stop: review_stop
+    url: http://${CI_COMMIT_REF_SLUG}.${CHART_NAME}.dev.finbel.intra
+  only:
+    - branches
+  except:
+    - master
+    - /^hotfix/.*$/
+    - tags
+
+.uninstall: &uninstall
+  cache: {}
+  dependencies: []
+  image: finvmharborp01.finbel.intra/trv-gitlab-runner/helm-kubectl:3.2.1
+  script:
+    - *kube_config
+    - echo "Uninstalling release ${RELEASE_NAME} in namespace ${K8S_NAMESPACE}"
+    - helm uninstall $RELEASE_NAME --kube-context $ENV_NAME --namespace ${K8S_NAMESPACE}
+  when: manual
+  environment:
+    name: $ENV_NAME
+    action: stop
+
+review_stop:
+  <<: *uninstall
+  stage: Review
+  needs:
+    - version
+    - publish_helm
+  variables:
+    GIT_STRATEGY: none
+    ENV_NAME: $CI_COMMIT_REF_NAME
+    RELEASE_NAME: ${CHART_NAME}-${CI_COMMIT_REF_SLUG}
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+  only:
+    - branches
+  except:
+    - master
+    - /^hotfix/.*$/
+    - tags
+
+test_deploy:
+  <<: *install
+  stage: QA:Deploy
+  needs:
+    - version
+    - publish_docker
+    - publish_helm
+  variables:
+    ENV_NAME: test
+    ENV_HOST: ${DNS_NAME}.test.finbel.intra
+  environment:
+    name: $ENV_NAME
+    url: http://${ENV_HOST}
+  only:
+    - master
+
+release:
+  stage: Release
+  image: finvmharborp01.finbel.intra/trv-utility/semantic-version:17.1.2
+  dependencies: []
+  needs:
+    - version
+  cache: {}
+  allow_failure: true
+  variables:
+    GIT_DEPTH: 0 # make sure we have all the tags, tune this value if the repo gets to big
+    GITLAB_TOKEN: $RELEASE_BOT_ACCESS_TOKEN
+    GITLAB_URL: http://$CI_SERVER_HOST
+  script:
+    - semantic-release
+      --plugins @semantic-release/commit-analyzer
+      @semantic-release/release-notes-generator
+      @semantic-release/gitlab
+      --repository-url $CI_REPOSITORY_URL
+  when: manual
+  only:
+    - master
+    - /^hotfix/.*$/
+
+deploy_acceptance:
+  <<: *install
+  stage: Deploy
+  needs:
+    - version
+    - publish_docker
+    - publish_helm
+  variables:
+    ENV_NAME: acceptance
+    ENV_HOST: ${DNS_NAME}.acc.finbel.intra
+  when: manual
+  allow_failure: true
+  only:
+    - tags
+
+deploy_production:
+  <<: *install
+  stage: Deploy
+  needs:
+    - version
+    - publish_docker
+    - publish_helm
+  variables:
+    ENV_NAME: production
+    ENV_HOST: ${DNS_NAME}.finbel.intra
+  when: manual
+  allow_failure: false
+  only:
+    - tags

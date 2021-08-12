@@ -1,0 +1,8 @@
+# Ignore artifacts:
+dist
+coverage
+chart/templates
+nodes_modules
+.vscode
+output
+package-lock.json
