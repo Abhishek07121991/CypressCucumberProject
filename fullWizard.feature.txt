@@ -1,0 +1,57 @@
+ Then the Question Wizard form is submitted successfully
+    When I am on General declaration information page
+    And I fillin the General declaration information form
+    And I click next button on General declaration information page
+    Then the General declaration information form is submitted successfully
+
+    When I am on Declaration parties page
+    And I fillin the Declaration parties form
+    And I click next button on Declaration parties page
+    Then the Declaration parties form is submitted successfully
+
+    When I am on Master consignment information page
+    And I fillin the Master consignment information form
+    And I click next button on Master consignment information page
+    Then the Master consignment information form is submitted successfully
+
+    When I am on Master consignment parties page
+    And I fillin the Master consignment parties form
+    And I click next button on Master consignment parties page
+    Then the Master consignment parties form is submitted successfully
+
+    When I am on Master consignment items page
+    And I fillin the Master consignment items form
+    And I click next button on Master consignment items page
+    Then the Master consignment items form is submitted successfully
+
+    When I am on House consignment information page
+    And I fillin the House consignment information form
+    And I click next button on House consignment information page
+    Then the House consignment information form is submitted successfully
+
+    When I am on House consignment parties page
+    And I fillin the House consignment parties form
+    And I click next button on House consignment parties page
+    Then the House consignment parties form is submitted successfully
+
+    When I am on House consignment Items page
+    And I fillin the House consignment Items form
+    And I click next button on House consignment Items page
+    Then the House consignment Items form is submitted successfully
+    And review and confirm submission dialog is displayed
+    And I review important infirmation
+    When I click CONFIRM button
+    Then I navigated to the consult declaration page
+    And I should see a submission succeeded message
+
+  @Regression @End2End
+  Scenario: Successfully submit a new combined declaration without ENS reuse facility
+    When I select radio buttons as follows:
+      | field            | value    |
+      | tsdType          | combined |
+      | reuseENS         | no       |
+      | consignmentType  | both     |
+      | consignmentItems | master   |
+
+    And I click the Start Declaration button
+    Then the Question Wizard form is submitted successfully
